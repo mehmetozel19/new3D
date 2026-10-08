@@ -1,4 +1,7 @@
 import 'dart:io';
+import 'dart:isolate';
+import 'dart:typed_data';
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter/foundation.dart';
@@ -12,10 +15,27 @@ import '../../../models/editor_models.dart';
 import 'room_editor_page.dart';
 import '../../../models/panorama_data.dart';
 
+
+
+
+
+// ============================================================================
+// AI CLASSIFIER
+// ============================================================================
+
 class AIClassifier {
-
   Interpreter? _interpreter;
+  IsolateInterpreter? _isolateInterpreter;
 
+  // 2 adet kalıcı resim worker'ı
+  final List<_ImagePrepareWorker> _workers = [];
+
+  int _nextWorker = 0;
+
+  // Aynı interpreter'a iki inference'ın aynı anda girmesini engeller.
+  Future<void> _inferenceTail = Future<void>.value();
+
+  Future<void>? _loadingFuture;
 
   final List<String> labels = [
     'backyard',
@@ -23,278 +43,837 @@ class AIClassifier {
     'bedroom',
     'frontyard',
     'kitchen',
-    'livingRoom'
+    'livingRoom',
   ];
 
 
+  // ==========================================================================
+  // MODEL + WORKER'LARI YÜKLE
+  // ==========================================================================
 
-  // -----------------------------
-  // MODEL YÜKLE
-  // -----------------------------
-  Future<void> loadModel() async {
+  Future<void> loadModel() {
+    // Aynı anda birden fazla loadModel çağrılırsa
+    // tek yükleme işlemini paylaş.
+    return _loadingFuture ??= _loadEverything();
+  }
 
-    if (_interpreter != null) return;
+
+  Future<void> _loadEverything() async {
+    try {
+      // ----------------------------------------------------------------------
+      // TFLITE MODEL
+      // ----------------------------------------------------------------------
+
+      _interpreter = await Interpreter.fromAsset(
+        'assets/room_model.tflite',
+      );
+
+      _isolateInterpreter = await IsolateInterpreter.create(
+        address: _interpreter!.address,
+      );
+
+
+      debugPrint('======================================');
+      debugPrint('MODEL YÜKLENDİ');
+
+      debugPrint(
+        'INPUT SHAPE : ${_interpreter!.getInputTensor(0).shape}',
+      );
+
+      debugPrint(
+        'INPUT TYPE  : ${_interpreter!.getInputTensor(0).type}',
+      );
+
+      debugPrint(
+        'OUTPUT SHAPE: ${_interpreter!.getOutputTensor(0).shape}',
+      );
+
+      debugPrint(
+        'OUTPUT TYPE : ${_interpreter!.getOutputTensor(0).type}',
+      );
+
+
+      // ----------------------------------------------------------------------
+      // 2 KALICI IMAGE WORKER
+      // ----------------------------------------------------------------------
+
+      if (_workers.isEmpty) {
+        final worker1 = _ImagePrepareWorker();
+        final worker2 = _ImagePrepareWorker();
+
+        await Future.wait([
+          worker1.start(),
+          worker2.start(),
+        ]);
+
+        _workers.add(worker1);
+        _workers.add(worker2);
+      }
+
+      debugPrint(
+        'IMAGE WORKER SAYISI: ${_workers.length}',
+      );
+
+      debugPrint('======================================');
+    } catch (e, stackTrace) {
+      debugPrint('AI başlatma hatası: $e');
+      debugPrint('$stackTrace');
+
+      _loadingFuture = null;
+
+      rethrow;
+    }
+  }
+
+
+  // ==========================================================================
+  // TEK RESİM SINIFLANDIR
+  // ==========================================================================
+
+  Future<String> classifyImage(
+      String imagePath,
+      ) async {
+    await loadModel();
+
+    if (_interpreter == null ||
+        _isolateInterpreter == null ||
+        _workers.isEmpty) {
+      return 'Model yok';
+    }
+
+    try {
+      // ----------------------------------------------------------------------
+      // WORKER SEÇ
+      // ----------------------------------------------------------------------
+
+      final worker = _workers[
+      _nextWorker % _workers.length
+      ];
+
+      _nextWorker++;
+
+
+      // ----------------------------------------------------------------------
+      // BÜYÜK RESİM:
+      //
+      // 8K JPEG
+      //   ↓
+      // background worker
+      //   ↓
+      // decode
+      //   ↓
+      // 224 x 224
+      //   ↓
+      // Float32 RGB
+      //
+      // UI bu sırada bloklanmaz.
+      // ----------------------------------------------------------------------
+
+      final Float32List inputBuffer =
+      await worker.prepareImage(
+        imagePath,
+      );
+
+
+      // ----------------------------------------------------------------------
+      // [1,224,224,3]
+      // ----------------------------------------------------------------------
+
+      final input = inputBuffer.reshape(
+        [1, 224, 224, 3],
+      );
+
+
+      // ----------------------------------------------------------------------
+      // [1,6]
+      // ----------------------------------------------------------------------
+
+      final output =
+      List<double>.filled(
+        labels.length,
+        0.0,
+      ).reshape(
+        [1, labels.length],
+      );
+
+
+      // ----------------------------------------------------------------------
+      // INFERENCE
+      //
+      // Interpreter aynı anda yalnızca tek inference çalıştıracak.
+      // ----------------------------------------------------------------------
+
+      final results =
+      await _runInferenceLocked(
+        input,
+        output,
+      );
+
+
+      // ----------------------------------------------------------------------
+      // EN YÜKSEK SONUÇ
+      // ----------------------------------------------------------------------
+
+      int bestIndex = 0;
+
+      for (int i = 1;
+      i < results.length;
+      i++) {
+        if (results[i] >
+            results[bestIndex]) {
+          bestIndex = i;
+        }
+      }
+
+
+      final confidence =
+          results[bestIndex] * 100;
+
+
+      debugPrint('--------------------------------');
+
+      for (int i = 0;
+      i < labels.length;
+      i++) {
+        debugPrint(
+          '${labels[i]} : '
+              '${results[i].toStringAsFixed(5)}',
+        );
+      }
+
+      debugPrint(
+        'TAHMİN = ${labels[bestIndex]} '
+            '%${confidence.toStringAsFixed(2)}',
+      );
+
+      debugPrint('--------------------------------');
+
+
+      return labels[bestIndex];
+    } catch (e, stackTrace) {
+      debugPrint(
+        'AI sınıflandırma hatası: $e',
+      );
+
+      debugPrint('$stackTrace');
+
+      return 'backyard';
+    }
+  }
+
+
+  // ==========================================================================
+  // TFLITE INFERENCE LOCK
+  // ==========================================================================
+
+  Future<List<double>> _runInferenceLocked(
+      Object input,
+      dynamic output,
+      ) async {
+    // Önceki inference tamamlanana kadar bekle.
+    final previous =
+        _inferenceTail;
+
+    final release =
+    Completer<void>();
+
+    _inferenceTail =
+        release.future;
+
+
+    await previous;
 
 
     try {
-
-      _interpreter =
-      await Interpreter.fromAsset(
-          'assets/room_model.tflite'
+      await _isolateInterpreter!.run(
+        input,
+        output,
       );
 
-
-      debugPrint("MODEL YÜKLENDİ");
-
-
-      debugPrint(
-          "INPUT SHAPE : "
-              "${_interpreter!
-              .getInputTensor(0)
-              .shape}"
+      return List<double>.from(
+        output[0],
       );
-
-
-      debugPrint(
-          "INPUT TYPE : "
-              "${_interpreter!
-              .getInputTensor(0)
-              .type}"
-      );
-
-
-      debugPrint(
-          "OUTPUT SHAPE : "
-              "${_interpreter!
-              .getOutputTensor(0)
-              .shape}"
-      );
-
-
-      debugPrint(
-          "OUTPUT TYPE : "
-              "${_interpreter!
-              .getOutputTensor(0)
-              .type}"
-      );
-
-
-
-    } catch(e){
-
-      debugPrint(
-          "Model yükleme hatası: $e"
-      );
-
+    } finally {
+      release.complete();
     }
-
   }
 
 
+  // ==========================================================================
+  // TOPLU SINIFLANDIRMA
+  //
+  // Aynı anda en fazla 2 görüntü hazırlıyoruz.
+  // ==========================================================================
 
-
-
-  // -----------------------------
-  // RESİM SINIFLANDIR
-  // -----------------------------
-  Future<String> classifyImage(
-      String imagePath
-      ) async {
-
-
+  Future<List<String>> classifyImages(
+      List<String> imagePaths, {
+        void Function(
+            int completed,
+            int total,
+            String currentPath,
+            )? onProgress,
+      }) async {
     await loadModel();
 
-
-    if(_interpreter == null){
-
-      return "Model yok";
-
-    }
-
-
-
-    // -------------------------
-    // RESİM OKUMA
-    // -------------------------
-
-    final bytes =
-    File(imagePath)
-        .readAsBytesSync();
-
-
-    img.Image? image =
-    img.decodeImage(bytes);
-
-
-
-    if(image == null){
-
-      return "Resim okunamadı";
-
-    }
-
-
-
-    // Python:
-    // cv2.resize(img_rgb,(224,224))
-
-    final resized =
-    img.copyResize(
-      image,
-      width:224,
-      height:224,
-      interpolation:
-      img.Interpolation.linear,
+    final results =
+    List<String>.filled(
+      imagePaths.length,
+      'backyard',
     );
 
 
+    // ------------------------------------------------------------------------
+    // 2'Lİ GRUPLAR
+    // ------------------------------------------------------------------------
+
+    for (int start = 0;
+    start < imagePaths.length;
+    start += 2) {
+
+      final end =
+      (start + 2 < imagePaths.length)
+          ? start + 2
+          : imagePaths.length;
 
 
-    // -------------------------
-    // INPUT TENSOR
-    // Python:
-    // float32
-    // 0-255
-    // [1,224,224,3]
-    // -------------------------
+      final futures =
+      <Future<void>>[];
 
 
-    final input =
-    List.generate(
-      1,
-          (_) =>
-          List.generate(
-            224,
-                (y)=>
-                List.generate(
-                  224,
-                      (x){
+      for (int i = start;
+      i < end;
+      i++) {
 
+        futures.add(
+              () async {
+            final path =
+            imagePaths[i];
 
-                    final pixel =
-                    resized.getPixel(x,y);
+            final prediction =
+            await classifyImage(path);
 
+            results[i] =
+                prediction;
 
-
-                    return [
-
-                      pixel.r.toDouble(),
-
-                      pixel.g.toDouble(),
-
-                      pixel.b.toDouble(),
-
-
-                    ];
-
-
-                  },
-                ),
-          ),
-    );
-
-
-
-
-
-    // -------------------------
-    // OUTPUT
-    // -------------------------
-
-
-    final output =
-    List.generate(
-      1,
-          (_) =>
-          List.filled(
-              labels.length,
-              0.0
-          ),
-    );
-
-
-
-
-    // MODEL ÇALIŞTIR
-
-    _interpreter!.run(
-        input,
-        output
-    );
-
-
-
-
-
-    final result =
-    List<double>.from(
-        output[0]
-    );
-
-
-
-    debugPrint("------------------");
-
-
-    for(int i=0;i<labels.length;i++){
-
-      debugPrint(
-          "${labels[i]} : "
-              "${result[i]}"
-      );
-
-    }
-
-
-
-    // -------------------------
-    // MAX BUL
-    // -------------------------
-
-    int index=0;
-
-
-    for(int i=1;i<result.length;i++){
-
-      if(result[i]>result[index]){
-
-        index=i;
-
+            onProgress?.call(
+              i + 1,
+              imagePaths.length,
+              path,
+            );
+          }(),
+        );
       }
 
+
+      // İki resmin işi bitmeden
+      // sonraki iki resmi başlatma.
+      await Future.wait(
+        futures,
+      );
+
+
+      // UI'ya frame fırsatı ver.
+      await Future<void>.delayed(
+        Duration.zero,
+      );
     }
 
 
-
-    double confidence =
-        result[index]*100;
-
+    return results;
+  }
 
 
-    debugPrint(
-        "TAHMİN : "
-            "${labels[index]}"
-            "  %"
-            "${confidence.toStringAsFixed(2)}"
+  // ==========================================================================
+  // KAPAT
+  // ==========================================================================
+
+  Future<void> dispose() async {
+    // Önce image worker'ları kapat.
+    for (final worker in _workers) {
+      await worker.dispose();
+    }
+
+    _workers.clear();
+
+
+    try {
+      await _isolateInterpreter?.close();
+    } catch (e) {
+      debugPrint(
+        'IsolateInterpreter kapatma hatası: $e',
+      );
+    }
+
+
+    try {
+      _interpreter?.close();
+    } catch (e) {
+      debugPrint(
+        'Interpreter kapatma hatası: $e',
+      );
+    }
+
+
+    _isolateInterpreter = null;
+    _interpreter = null;
+    _loadingFuture = null;
+  }
+}
+
+
+// ============================================================================
+// KALICI IMAGE WORKER
+// ============================================================================
+
+class _ImagePrepareWorker {
+  Isolate? _isolate;
+  SendPort? _sendPort;
+
+
+  Future<void> start() async {
+    if (_sendPort != null) {
+      return;
+    }
+
+
+    final readyPort =
+    ReceivePort();
+
+
+    _isolate =
+    await Isolate.spawn(
+      _imageWorkerMain,
+      readyPort.sendPort,
+      debugName: 'PanoramaImageWorker',
     );
 
 
+    final firstMessage =
+    await readyPort.first;
 
-    return labels[index];
 
+    if (firstMessage is! SendPort) {
+      readyPort.close();
+
+      throw Exception(
+        'Image worker başlatılamadı.',
+      );
+    }
+
+
+    _sendPort =
+        firstMessage;
+
+
+    readyPort.close();
   }
 
 
+  // ==========================================================================
+  // RESİM HAZIRLA
+  // ==========================================================================
+
+  Future<Float32List> prepareImage(
+      String imagePath,
+      ) async {
+    if (_sendPort == null) {
+      throw Exception(
+        'Image worker hazır değil.',
+      );
+    }
 
 
+    final responsePort =
+    ReceivePort();
 
-  void dispose(){
 
-    _interpreter?.close();
+    _sendPort!.send({
+      'command': 'prepare',
+      'path': imagePath,
+      'replyPort':
+      responsePort.sendPort,
+    });
 
+
+    final response =
+    await responsePort.first;
+
+
+    responsePort.close();
+
+
+    if (response is! Map) {
+      throw Exception(
+        'Image worker geçersiz cevap gönderdi.',
+      );
+    }
+
+
+    if (response['success'] != true) {
+      throw Exception(
+        response['error'] ??
+            'Resim hazırlanamadı.',
+      );
+    }
+
+
+    final transferable =
+    response['data'];
+
+
+    if (transferable
+    is! TransferableTypedData) {
+      throw Exception(
+        'Worker tensor verisi hatalı.',
+      );
+    }
+
+
+    final ByteBuffer buffer =
+    transferable.materialize();
+
+
+    final Uint8List bytes =
+    buffer.asUint8List();
+
+
+    return Float32List.view(
+      bytes.buffer,
+      bytes.offsetInBytes,
+      bytes.lengthInBytes ~/
+          Float32List.bytesPerElement,
+    );
   }
 
 
+  // ==========================================================================
+  // WORKER KAPAT
+  // ==========================================================================
+
+  Future<void> dispose() async {
+    try {
+      _sendPort?.send({
+        'command': 'close',
+      });
+    } catch (_) {}
+
+
+    _sendPort = null;
+
+
+    _isolate?.kill(
+      priority:
+      Isolate.immediate,
+    );
+
+
+    _isolate = null;
+  }
+}
+
+
+// ============================================================================
+// WORKER ENTRY POINT
+//
+// MUTLAKA CLASS DIŞINDA OLMALI.
+// ============================================================================
+
+void _imageWorkerMain(
+    SendPort mainSendPort,
+    ) async {
+  final receivePort =
+  ReceivePort();
+
+
+  // Ana isolate'a worker'ın SendPort'unu gönder.
+  mainSendPort.send(
+    receivePort.sendPort,
+  );
+
+
+  await for (final message
+  in receivePort) {
+
+    if (message is! Map) {
+      continue;
+    }
+
+
+    final command =
+    message['command'];
+
+
+    // ------------------------------------------------------------------------
+    // CLOSE
+    // ------------------------------------------------------------------------
+
+    if (command == 'close') {
+      receivePort.close();
+      break;
+    }
+
+
+    // ------------------------------------------------------------------------
+    // PREPARE
+    // ------------------------------------------------------------------------
+
+    if (command == 'prepare') {
+      final path =
+      message['path'] as String?;
+
+      final replyPort =
+      message['replyPort']
+      as SendPort?;
+
+
+      if (path == null ||
+          replyPort == null) {
+        continue;
+      }
+
+
+      try {
+        final input =
+        _prepareImageTensor(
+          path,
+        );
+
+
+        // Float32 verisini kopyalamak yerine
+        // transferable memory olarak gönder.
+        final data =
+        TransferableTypedData.fromList([
+          input.buffer.asUint8List(
+            input.offsetInBytes,
+            input.lengthInBytes,
+          ),
+        ]);
+
+
+        replyPort.send({
+          'success': true,
+          'data': data,
+        });
+      } catch (e, stackTrace) {
+        replyPort.send({
+          'success': false,
+          'error': e.toString(),
+          'stackTrace':
+          stackTrace.toString(),
+        });
+      }
+    }
+  }
+}
+
+
+// ============================================================================
+// BÜYÜK PANORAMAYI 224x224 MODEL TENSORUNA DÖNÜŞTÜR
+//
+// BU FONKSİYON BACKGROUND WORKER'DA ÇALIŞIR.
+// ============================================================================
+
+Float32List _prepareImageTensor(
+    String imagePath,
+    ) {
+  // --------------------------------------------------------------------------
+  // 1. DOSYAYI OKU
+  // --------------------------------------------------------------------------
+
+  final bytes =
+  File(imagePath)
+      .readAsBytesSync();
+
+
+  // --------------------------------------------------------------------------
+  // 2. JPEG / PNG DECODE
+  // --------------------------------------------------------------------------
+
+  img.Image? image =
+  img.decodeImage(bytes);
+
+
+  if (image == null) {
+    throw Exception(
+      'Resim decode edilemedi: '
+          '$imagePath',
+    );
+  }
+
+
+  // --------------------------------------------------------------------------
+  // 3. 224 x 224
+  //
+  // Python:
+  // cv2.resize(img_rgb, (224,224))
+  // --------------------------------------------------------------------------
+
+  final resized =
+  img.copyResize(
+    image,
+    width: 224,
+    height: 224,
+    interpolation:
+    img.Interpolation.linear,
+  );
+
+
+  // Büyük resim referansını bırak.
+  image = null;
+
+
+  // --------------------------------------------------------------------------
+  // 4. FLOAT32 RGB
+  //
+  // Model:
+  // [1,224,224,3]
+  //
+  // Python testinde preprocess_input sonrası:
+  //
+  // min = 0
+  // max = 255
+  //
+  // Dolayısıyla NORMALIZATION YOK.
+  // --------------------------------------------------------------------------
+
+  final input =
+  Float32List(
+    224 * 224 * 3,
+  );
+
+
+  int index = 0;
+
+
+  for (int y = 0;
+  y < 224;
+  y++) {
+
+    for (int x = 0;
+    x < 224;
+    x++) {
+
+      final pixel =
+      resized.getPixel(
+        x,
+        y,
+      );
+
+
+      input[index++] =
+          pixel.r.toDouble();
+
+      input[index++] =
+          pixel.g.toDouble();
+
+      input[index++] =
+          pixel.b.toDouble();
+    }
+  }
+
+
+  return input;
+}
+
+// ======================================================================
+// BU FONKSİYON CLASS DIŞINDA OLACAK
+// ======================================================================
+//
+// Büyük panorama:
+//
+// 8192 x 4096
+//      ↓
+// isolate içinde decode
+//      ↓
+// 224 x 224 resize
+//      ↓
+// RGB Float32
+//      ↓
+// ana isolate'a yalnızca küçük tensor döner
+//
+// ======================================================================
+
+Float32List _prepareImageForModel(
+    String imagePath,
+    ) {
+  // ----------------------------------------------------------
+  // Dosyayı worker isolate içinde oku
+  // ----------------------------------------------------------
+
+  final Uint8List bytes =
+  File(imagePath).readAsBytesSync();
+
+  // ----------------------------------------------------------
+  // JPEG / PNG decode
+  // ----------------------------------------------------------
+
+  img.Image? image =
+  img.decodeImage(bytes);
+
+  if (image == null) {
+    throw Exception(
+      'Resim decode edilemedi: $imagePath',
+    );
+  }
+
+  // ----------------------------------------------------------
+  // 224 x 224
+  //
+  // Python:
+  //
+  // cv2.resize(img_rgb, (224,224))
+  //
+  // ----------------------------------------------------------
+
+  final img.Image resized =
+  img.copyResize(
+    image,
+    width: 224,
+    height: 224,
+    interpolation: img.Interpolation.linear,
+  );
+
+  // Büyük resmi artık kullanmıyoruz
+  image = null;
+
+  // ----------------------------------------------------------
+  // FLOAT32 TENSOR
+  //
+  // Model:
+  // [1,224,224,3]
+  //
+  // Python tarafında:
+  //
+  // min = 0
+  // max = 255
+  //
+  // Bu nedenle normalization YOK.
+  // ----------------------------------------------------------
+
+  final Float32List input =
+  Float32List(
+    224 * 224 * 3,
+  );
+
+  int index = 0;
+
+  for (int y = 0; y < 224; y++) {
+    for (int x = 0; x < 224; x++) {
+      final pixel =
+      resized.getPixel(x, y);
+
+      input[index++] =
+          pixel.r.toDouble();
+
+      input[index++] =
+          pixel.g.toDouble();
+
+      input[index++] =
+          pixel.b.toDouble();
+    }
+  }
+
+  return input;
 }
 
 class HouseCreatorScreen extends StatefulWidget {
@@ -331,13 +910,19 @@ class _HouseCreatorScreenState extends State<HouseCreatorScreen> {
   bool get _hasChanges => _computeDigest() != _initialDigest;
 
   late _HouseSnapshot _snapshot;
-
   bool _saving = false;
+
+// TOPLU YÜKLEME İLERLEME BİLGİLERİ
+  bool _batchUploading = false;
+  int _batchCurrent = 0;
+  int _batchTotal = 0;
+  String _batchFileName = '';
 
   PanoramaData? _draftHouse;
   int? _createdHouseIndex;
 
   bool _showReorderIndicators = false;
+
   final Map<FloorEditor, int> _originalFloorOrder = {};
 
   final Map<FloorEditor, Map<EditableRoom, int>> _originalRoomOrder = {};
@@ -803,10 +1388,13 @@ class _HouseCreatorScreenState extends State<HouseCreatorScreen> {
   }
 
   @override
+  @override
   Widget build(BuildContext context) {
     final base = ThemeData.light();
+
     final themed = base.copyWith(
       scaffoldBackgroundColor: AppStyles.surfaceMuted,
+
       appBarTheme: base.appBarTheme.copyWith(
         backgroundColor: Colors.transparent,
         foregroundColor: AppStyles.textPrimary,
@@ -815,297 +1403,772 @@ class _HouseCreatorScreenState extends State<HouseCreatorScreen> {
         toolbarHeight: 44,
         centerTitle: true,
         titleSpacing: 8,
+
         titleTextStyle: TextStyle(
           color: AppStyles.textPrimary,
           fontSize: 16,
           fontWeight: FontWeight.w600,
         ),
+
         toolbarTextStyle: TextStyle(
           color: AppStyles.textPrimary,
           fontSize: 14,
           fontWeight: FontWeight.w500,
         ),
-        iconTheme: IconThemeData(color: AppStyles.textPrimary, size: 20),
-        actionsIconTheme: IconThemeData(color: AppStyles.textPrimary, size: 20),
+
+        iconTheme: IconThemeData(
+          color: AppStyles.textPrimary,
+          size: 20,
+        ),
+
+        actionsIconTheme: IconThemeData(
+          color: AppStyles.textPrimary,
+          size: 20,
+        ),
+
         systemOverlayStyle: SystemUiOverlayStyle.dark,
       ),
+
       textTheme: base.textTheme.apply(
         bodyColor: AppStyles.textPrimary,
         displayColor: AppStyles.textPrimary,
       ),
+
       dropdownMenuTheme: DropdownMenuThemeData(
-        textStyle: TextStyle(color: AppStyles.textPrimary),
+        textStyle: TextStyle(
+          color: AppStyles.textPrimary,
+        ),
+
         menuStyle: MenuStyle(
-          backgroundColor: WidgetStatePropertyAll(AppStyles.surface),
+          backgroundColor: WidgetStatePropertyAll(
+            AppStyles.surface,
+          ),
+
           elevation: const WidgetStatePropertyAll(4),
+
           shape: WidgetStatePropertyAll(
             RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(AppStyles.cardRadius),
+              borderRadius: BorderRadius.circular(
+                AppStyles.cardRadius,
+              ),
             ),
           ),
         ),
       ),
+
       inputDecorationTheme: InputDecorationTheme(
         filled: true,
         fillColor: AppStyles.surface,
+
         contentPadding: const EdgeInsets.symmetric(
           horizontal: 16,
           vertical: 16,
         ),
+
         border: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(AppStyles.cardRadius),
+          borderRadius: BorderRadius.circular(
+            AppStyles.cardRadius,
+          ),
           borderSide: BorderSide(
             color: AppStyles.border,
             width: AppStyles.borderWidth,
           ),
         ),
+
         enabledBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(AppStyles.cardRadius),
+          borderRadius: BorderRadius.circular(
+            AppStyles.cardRadius,
+          ),
           borderSide: BorderSide(
             color: AppStyles.border,
             width: AppStyles.borderWidth,
           ),
         ),
+
         focusedBorder: OutlineInputBorder(
-          borderRadius: BorderRadius.circular(AppStyles.cardRadius),
+          borderRadius: BorderRadius.circular(
+            AppStyles.cardRadius,
+          ),
           borderSide: BorderSide(
             color: AppStyles.textPrimary,
             width: 1.5,
           ),
         ),
-        labelStyle: TextStyle(color: AppStyles.textSecondary),
+
+        labelStyle: TextStyle(
+          color: AppStyles.textSecondary,
+        ),
+
         floatingLabelStyle: TextStyle(
           color: AppStyles.textPrimary,
           fontWeight: FontWeight.w600,
         ),
-        hintStyle: TextStyle(color: AppStyles.textSecondary.withOpacity(0.5)),
+
+        hintStyle: TextStyle(
+          color: AppStyles.textSecondary.withOpacity(0.5),
+        ),
+
         prefixIconColor: AppStyles.textSecondary,
       ),
+
       chipTheme: base.chipTheme.copyWith(
         backgroundColor: AppStyles.surface,
         selectedColor: AppStyles.controlBgActive,
-        side: BorderSide(color: AppStyles.border, width: AppStyles.borderWidth),
-        labelStyle: TextStyle(color: AppStyles.textPrimary),
+
+        side: BorderSide(
+          color: AppStyles.border,
+          width: AppStyles.borderWidth,
+        ),
+
+        labelStyle: TextStyle(
+          color: AppStyles.textPrimary,
+        ),
+
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(AppStyles.cardRadius),
+          borderRadius: BorderRadius.circular(
+            AppStyles.cardRadius,
+          ),
+
           side: BorderSide(
             color: AppStyles.border,
             width: AppStyles.borderWidth,
           ),
         ),
       ),
+
       outlinedButtonTheme: OutlinedButtonThemeData(
         style: OutlinedButton.styleFrom(
           foregroundColor: AppStyles.textPrimary,
           backgroundColor: AppStyles.surface,
           elevation: 0,
+
           side: BorderSide(
             color: AppStyles.border,
             width: AppStyles.borderWidth,
           ),
+
           shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(AppStyles.cardRadius),
+            borderRadius: BorderRadius.circular(
+              AppStyles.cardRadius,
+            ),
           ),
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+
+          padding: const EdgeInsets.symmetric(
+            horizontal: 12,
+            vertical: 10,
+          ),
         ),
       ),
+
       elevatedButtonTheme: ElevatedButtonThemeData(
         style: ElevatedButton.styleFrom(
           foregroundColor: AppStyles.textPrimary,
           backgroundColor: AppStyles.surface,
           elevation: 0,
+
           side: BorderSide(
             color: AppStyles.border,
             width: AppStyles.borderWidth,
           ),
+
           shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(AppStyles.cardRadius),
+            borderRadius: BorderRadius.circular(
+              AppStyles.cardRadius,
+            ),
           ),
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+
+          padding: const EdgeInsets.symmetric(
+            horizontal: 12,
+            vertical: 10,
+          ),
         ),
       ),
     );
 
     return Theme(
       data: themed,
+
       child: Scaffold(
         backgroundColor: AppStyles.surfaceMuted,
+
         appBar: AppBar(
-            automaticallyImplyLeading: false,
-            title: const Text('House Creator')),
-        body: CustomScrollView(
-          slivers: [
-            SliverToBoxAdapter(
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(12, 12, 12, 8),
-                child: _ThumbnailBox(
-                  path: _houseThumbPath,
-                  onPick: (p) => setState(() => _houseThumbPath = p),
+          automaticallyImplyLeading: false,
+          title: const Text('House Creator'),
+        ),
+
+        // ==========================================
+        // BODY
+        // ==========================================
+        body: Stack(
+          children: [
+
+            // ---------------------------------------
+            // NORMAL HOUSE CREATOR EKRANI
+            // ---------------------------------------
+            CustomScrollView(
+              slivers: [
+
+                // HOUSE THUMBNAIL
+                SliverToBoxAdapter(
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(
+                      12,
+                      12,
+                      12,
+                      8,
+                    ),
+
+                    child: _ThumbnailBox(
+                      path: _houseThumbPath,
+
+                      onPick: (p) {
+                        setState(() {
+                          _houseThumbPath = p;
+                        });
+                      },
+                    ),
+                  ),
                 ),
-              ),
-            ),
-            SliverToBoxAdapter(
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(12, 12, 12, 0),
-                child: Column(
-                  children: [
-                    TextField(
-                      controller: _titleCtrl,
-                      style: TextStyle(
-                        color: AppStyles.textPrimary,
-                        fontWeight: FontWeight.bold,
-                      ),
-                      decoration: const InputDecoration(
-                        labelText: 'House title *',
-                        prefixIcon: Icon(Icons.home_outlined),
-                      ),
+
+                // -----------------------------------
+                // HOUSE INFORMATION
+                // -----------------------------------
+                SliverToBoxAdapter(
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(
+                      12,
+                      12,
+                      12,
+                      0,
                     ),
-                    const SizedBox(height: 12),
-                    TextField(
-                      controller: _addressCtrl,
-                      style: TextStyle(color: AppStyles.textPrimary),
-                      decoration: const InputDecoration(
-                        labelText: 'Address *',
-                        prefixIcon: Icon(Icons.location_on_outlined),
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    TextField(
-                      controller: _areaCtrl,
-                      style: TextStyle(color: AppStyles.textPrimary),
-                      keyboardType: const TextInputType.numberWithOptions(
-                        decimal: true,
-                      ),
-                      inputFormatters: [
-                        FilteringTextInputFormatter.allow(
-                          RegExp(r'^\d*\.?\d*'),
+
+                    child: Column(
+                      children: [
+
+                        TextField(
+                          controller: _titleCtrl,
+
+                          style: TextStyle(
+                            color: AppStyles.textPrimary,
+                            fontWeight: FontWeight.bold,
+                          ),
+
+                          decoration:
+                          const InputDecoration(
+                            labelText: 'House title *',
+                            prefixIcon:
+                            Icon(Icons.home_outlined),
+                          ),
+                        ),
+
+                        const SizedBox(height: 12),
+
+                        TextField(
+                          controller: _addressCtrl,
+
+                          style: TextStyle(
+                            color: AppStyles.textPrimary,
+                          ),
+
+                          decoration:
+                          const InputDecoration(
+                            labelText: 'Address *',
+                            prefixIcon:
+                            Icon(Icons.location_on_outlined),
+                          ),
+                        ),
+
+                        const SizedBox(height: 12),
+
+                        TextField(
+                          controller: _areaCtrl,
+
+                          style: TextStyle(
+                            color: AppStyles.textPrimary,
+                          ),
+
+                          keyboardType:
+                          const TextInputType
+                              .numberWithOptions(
+                            decimal: true,
+                          ),
+
+                          inputFormatters: [
+                            FilteringTextInputFormatter
+                                .allow(
+                              RegExp(r'^\d*\.?\d*'),
+                            ),
+                          ],
+
+                          decoration:
+                          const InputDecoration(
+                            labelText: 'Area (m²) *',
+                            prefixIcon:
+                            Icon(Icons.aspect_ratio),
+                          ),
                         ),
                       ],
-                      decoration: const InputDecoration(
-                        labelText: 'Area (m²) *',
-                        prefixIcon: Icon(Icons.aspect_ratio),
+                    ),
+                  ),
+                ),
+
+                const SliverToBoxAdapter(
+                  child: SizedBox(height: 12),
+                ),
+
+                // -----------------------------------
+                // FLOORS
+                // -----------------------------------
+                SliverToBoxAdapter(
+                  child: AnimatedSize(
+                    duration:
+                    const Duration(milliseconds: 300),
+
+                    curve: Curves.easeInOut,
+
+                    alignment: Alignment.topCenter,
+
+                    child: ReorderableListView(
+                      shrinkWrap: true,
+
+                      physics:
+                      const NeverScrollableScrollPhysics(),
+
+                      buildDefaultDragHandles: false,
+
+                      proxyDecorator:
+                          (child, index, animation) {
+                        return child;
+                      },
+
+                      onReorder:
+                          (oldIndex, newIndex) {
+                        setState(() {
+                          if (newIndex > oldIndex) {
+                            newIndex -= 1;
+                          }
+
+                          if (!_showReorderIndicators) {
+                            _captureOriginalFloorOrder();
+                          }
+
+                          final floor =
+                          _floors.removeAt(
+                            oldIndex,
+                          );
+
+                          _floors.insert(
+                            newIndex,
+                            floor,
+                          );
+
+                          final expanded =
+                          _floorExpanded.removeAt(
+                            oldIndex,
+                          );
+
+                          _floorExpanded.insert(
+                            newIndex,
+                            expanded,
+                          );
+
+                          _showReorderIndicators =
+                          true;
+                        });
+
+                        _syncStore();
+                      },
+
+                      children: [
+                        for (
+                        int index = 0;
+                        index < _floors.length;
+                        index++
+                        )
+                          Container(
+                            key: ObjectKey(
+                              _floors[index],
+                            ),
+
+                            child: _buildFloorTile(
+                              context,
+                              _floors[index],
+                              index,
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+
+                const SliverToBoxAdapter(
+                  child: SizedBox(height: 72),
+                ),
+              ],
+            ),
+
+            // =======================================
+            // TOPLU PANORAMA YÜKLEME EKRANI
+            // =======================================
+            if (_batchUploading)
+              Positioned.fill(
+                child: Container(
+                  color: Colors.black.withOpacity(0.40),
+
+                  child: Center(
+                    child: Container(
+                      width: 310,
+
+                      padding:
+                      const EdgeInsets.all(24),
+
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+
+                        borderRadius:
+                        BorderRadius.circular(18),
+
+                        boxShadow: const [
+                          BoxShadow(
+                            blurRadius: 20,
+                            offset: Offset(0, 8),
+                            color: Color.fromRGBO(
+                              0,
+                              0,
+                              0,
+                              0.20,
+                            ),
+                          ),
+                        ],
+                      ),
+
+                      child: Column(
+                        mainAxisSize:
+                        MainAxisSize.min,
+
+                        children: [
+
+                          // LOADING ICON
+                          const SizedBox(
+                            width: 42,
+                            height: 42,
+
+                            child:
+                            CircularProgressIndicator(
+                              strokeWidth: 4,
+                            ),
+                          ),
+
+                          const SizedBox(height: 20),
+
+                          // TITLE
+                          Text(
+                            'Loading panoramas',
+
+                            textAlign:
+                            TextAlign.center,
+
+                            style: TextStyle(
+                              fontSize: 17,
+
+                              fontWeight:
+                              FontWeight.w700,
+
+                              color:
+                              AppStyles.textPrimary,
+                            ),
+                          ),
+
+                          const SizedBox(height: 8),
+
+                          Text(
+                            'Artificial intelligence determines the room type.',
+
+                            textAlign:
+                            TextAlign.center,
+
+                            style: TextStyle(
+                              fontSize: 12,
+
+                              color:
+                              AppStyles.textSecondary,
+                            ),
+                          ),
+
+                          const SizedBox(height: 20),
+
+                          // CURRENT / TOTAL
+                          Text(
+                            '$_batchCurrent / $_batchTotal',
+
+                            style: TextStyle(
+                              fontSize: 16,
+
+                              fontWeight:
+                              FontWeight.w700,
+
+                              color:
+                              AppStyles.textPrimary,
+                            ),
+                          ),
+
+                          const SizedBox(height: 12),
+
+                          // PROGRESS BAR
+                          ClipRRect(
+                            borderRadius:
+                            BorderRadius.circular(10),
+
+                            child:
+                            LinearProgressIndicator(
+                              minHeight: 8,
+
+                              value:
+                              _batchTotal <= 0
+                                  ? 0
+                                  : (_batchCurrent /
+                                  _batchTotal)
+                                  .clamp(
+                                0.0,
+                                1.0,
+                              ),
+                            ),
+                          ),
+
+                          const SizedBox(height: 16),
+
+                          // CURRENT FILE
+                          Container(
+                            width: double.infinity,
+
+                            padding:
+                            const EdgeInsets.symmetric(
+                              horizontal: 12,
+                              vertical: 10,
+                            ),
+
+                            decoration: BoxDecoration(
+                              color:
+                              AppStyles.surfaceMuted,
+
+                              borderRadius:
+                              BorderRadius.circular(
+                                10,
+                              ),
+                            ),
+
+                            child: Text(
+                              _batchFileName.isEmpty
+                                  ? 'Preparing...'
+                                  : _batchFileName,
+
+                              textAlign:
+                              TextAlign.center,
+
+                              maxLines: 2,
+
+                              overflow:
+                              TextOverflow.ellipsis,
+
+                              style: TextStyle(
+                                fontSize: 12,
+
+                                color: AppStyles
+                                    .textSecondary,
+                              ),
+                            ),
+                          ),
+
+                          const SizedBox(height: 14),
+
+                          Text(
+                            'Please wait until the process is complete.',
+
+                            textAlign:
+                            TextAlign.center,
+
+                            style: TextStyle(
+                              fontSize: 11,
+
+                              color: AppStyles
+                                  .textSecondary
+                                  .withOpacity(0.8),
+                            ),
+                          ),
+                        ],
                       ),
                     ),
-                  ],
+                  ),
                 ),
               ),
-            ),
-            const SliverToBoxAdapter(child: SizedBox(height: 12)),
-            SliverToBoxAdapter(
-              child: AnimatedSize(
-                duration: const Duration(milliseconds: 300),
-                curve: Curves.easeInOut,
-                alignment: Alignment.topCenter,
-                child: ReorderableListView(
-                  shrinkWrap: true,
-                  physics: const NeverScrollableScrollPhysics(),
-                  buildDefaultDragHandles: false,
-                  proxyDecorator: (child, index, animation) => child,
-                  onReorder: (oldIndex, newIndex) {
-                    setState(() {
-                      if (newIndex > oldIndex) newIndex -= 1;
-
-                      if (!_showReorderIndicators) {
-                        _captureOriginalFloorOrder();
-                      }
-
-                      final floor = _floors.removeAt(oldIndex);
-                      _floors.insert(newIndex, floor);
-                      final expanded = _floorExpanded.removeAt(oldIndex);
-                      _floorExpanded.insert(newIndex, expanded);
-
-                      _showReorderIndicators = true;
-                    });
-                    _syncStore();
-                  },
-                  children: [
-                    for (int index = 0; index < _floors.length; index++)
-                      Container(
-                        key: ObjectKey(_floors[index]),
-                        child: _buildFloorTile(context, _floors[index], index),
-                      ),
-                  ],
-                ),
-              ),
-            ),
-            const SliverToBoxAdapter(child: SizedBox(height: 72)),
           ],
         ),
+
+        // ==========================================
+        // ALT MENÜ
+        // ==========================================
         bottomNavigationBar: SafeArea(
-          minimum: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+          minimum:
+          const EdgeInsets.fromLTRB(
+            16,
+            8,
+            16,
+            16,
+          ),
+
           child: Column(
             mainAxisSize: MainAxisSize.min,
+
             children: [
+
               _WhiteButton.icon(
                 icon: Icons.add,
                 label: 'Add Floor',
-                onPressed: _addFloor,
+
+                // Panorama yüklenirken butona basılmasın
+                onPressed: _batchUploading
+                    ? () {}
+                    : _addFloor,
               ),
+
               const SizedBox(height: 10),
+
               Row(
                 children: [
+
                   _WhiteButton.icon(
                     icon: Icons.delete_outline,
                     label: 'Delete house',
-                    onPressed: () async {
-                      final ok = await confirmDeleteDialog(
+
+                    onPressed: _batchUploading
+                        ? () {}
+                        : () async {
+                      final ok =
+                      await confirmDeleteDialog(
                         context,
-                        title: 'Delete house',
+
+                        title:
+                        'Delete house',
+
                         message:
                         'This will remove all floors, rooms, and connections.',
-                        confirmLabel: 'Delete',
-                        confirmIcon: Icons.delete_outline,
+
+                        confirmLabel:
+                        'Delete',
+
+                        confirmIcon:
+                        Icons.delete_outline,
                       );
+
                       if (!ok) return;
-                      final store = HousesStore.instance;
-                      if (widget.houseIndex != null &&
-                          widget.houseIndex! >= 0 &&
-                          widget.houseIndex! < store.houses.length) {
-                        store.deleteHouse(widget.houseIndex!);
-                        Navigator.of(context).pop();
+
+                      final store =
+                          HousesStore.instance;
+
+                      if (widget.houseIndex !=
+                          null &&
+                          widget.houseIndex! >=
+                              0 &&
+                          widget.houseIndex! <
+                              store.houses
+                                  .length) {
+
+                        store.deleteHouse(
+                          widget.houseIndex!,
+                        );
+
+                        if (!mounted) {
+                          return;
+                        }
+
+                        Navigator.of(context)
+                            .pop();
                       } else {
+
                         setState(() {
                           _floors.clear();
-                          final floor = FloorEditor();
-                          floor.rooms.add(EditableRoom());
-                          _floors.add(floor);
+
+                          final floor =
+                          FloorEditor();
+
+                          floor.rooms.add(
+                            EditableRoom(),
+                          );
+
+                          _floors.add(
+                            floor,
+                          );
+
                           _floorExpanded
                             ..clear()
-                            ..addAll(List<bool>.filled(_floors.length, false));
-                          _houseThumbPath = '';
-                          _titleCtrl.text = 'My House';
-                          _addressCtrl.text = '';
+                            ..addAll(
+                              List<bool>.filled(
+                                _floors.length,
+                                false,
+                              ),
+                            );
+
+                          _houseThumbPath =
+                          '';
+
+                          _titleCtrl.text =
+                          'My House';
+
+                          _addressCtrl.text =
+                          '';
+
                           _areaCtrl.text = '';
                         });
+
                         _syncStore();
                       }
                     },
                   ),
+
                   const Spacer(),
+
                   _WhiteButton.icon(
                     icon: Icons.exit_to_app,
                     label: 'Exit',
-                    onPressed: _onExitPressed,
+
+                    onPressed: _batchUploading
+                        ? () {}
+                        : _onExitPressed,
                   ),
+
                   const SizedBox(width: 8),
+
                   if (_saving)
+
                     const SizedBox(
                       width: 40,
                       height: kControlHeight,
+
                       child: Center(
                         child: SizedBox(
                           width: 18,
                           height: 18,
-                          child: CircularProgressIndicator(strokeWidth: 2),
+
+                          child:
+                          CircularProgressIndicator(
+                            strokeWidth: 2,
+                          ),
                         ),
                       ),
                     )
+
                   else
+
                     _WhiteButton.icon(
                       icon: Icons.check,
                       label: 'Save',
+
                       isPrimary: true,
-                      onPressed: () => _onSavePressed(),
+
+                      onPressed: _batchUploading
+                          ? () {}
+                          : () =>
+                          _onSavePressed(),
                     ),
                 ],
               ),
@@ -1545,85 +2608,159 @@ class _HouseCreatorScreenState extends State<HouseCreatorScreen> {
                             _WhiteButton.icon(
                               icon: Icons.upload_file,
                               label: 'Batch upload panoramas',
-                              onPressed: () async {
-                                final result =
-                                await FilePicker.platform.pickFiles(
-                                  type: FileType.image,
-                                  allowMultiple: true,
-                                );
-                                final files =
-                                    result?.files ?? const <PlatformFile>[];
-                                if (files.isEmpty) return;
+                                onPressed: () async {
+                                  final result = await FilePicker.platform.pickFiles(
+                                    type: FileType.image,
+                                    allowMultiple: true,
+                                  );
 
-                                files.sort((a, b) {
-                                  final an = (a.name).toLowerCase();
-                                  final bn = (b.name).toLowerCase();
-                                  return an.compareTo(bn);
-                                });
+                                  final files = result?.files ?? const <PlatformFile>[];
 
-                                setState(() {
-                                  if (floor.rooms.length == 1 &&
-                                      _isDefaultRoom(floor.rooms.first)) {
-                                    floor.rooms.removeAt(0);
-                                    floor.hotspots.clear();
-                                  }
-                                });
+                                  if (files.isEmpty) return;
 
-                                final startIndex = floor.rooms.length;
-
-                                for (var f in files) {
-                                  final path = f.path;
-                                  if (path == null || path.isEmpty) continue;
-
-                                  final room = EditableRoom();
-                                  room.isBatchUpload = true;
-                                  room.imagePath = path;
-                                  room.imageCtrl.text = path;
-
-                                  String predictedName = 'backyard';
-                                  try {
-                                    predictedName = await _aiClassifier.classifyImage(path);
-                                  } catch (e) {
-                                    debugPrint("AI Tahmin hatası: $e");
-                                  }
-
-                                  room.name = predictedName;
-                                  room.nameCtrl.text = predictedName;
-
-                                  setState(() {
-                                    floor.rooms.add(room);
+                                  // Dosyaları alfabetik sırala
+                                  files.sort((a, b) {
+                                    final an = a.name.toLowerCase();
+                                    final bn = b.name.toLowerCase();
+                                    return an.compareTo(bn);
                                   });
-                                }
 
-                                setState(() {
-                                  final lastNew = floor.rooms.length - 1;
-                                  final firstNew = startIndex;
+                                  // Eğer sadece varsayılan boş oda varsa kaldır
+                                  setState(() {
+                                    if (floor.rooms.length == 1 &&
+                                        _isDefaultRoom(floor.rooms.first)) {
+                                      floor.rooms.removeAt(0);
+                                      floor.hotspots.clear();
+                                    }
 
-                                  if (firstNew > 0) {
-                                    final prev = firstNew - 1;
-                                    _ensureBidirectionalConnection(
-                                      floor,
-                                      prev,
-                                      firstNew,
+                                    _batchUploading = true;
+                                    _batchCurrent = 0;
+                                    _batchTotal = files.length;
+                                    _batchFileName = '';
+                                  });
+
+                                  final startIndex = floor.rooms.length;
+
+                                  try {
+                                    for (int i = 0; i < files.length; i++) {
+                                      final f = files[i];
+
+                                      final path = f.path;
+
+                                      if (path == null || path.isEmpty) {
+                                        continue;
+                                      }
+
+                                      if (!mounted) return;
+
+                                      setState(() {
+                                        _batchCurrent = i + 1;
+                                        _batchFileName = f.name;
+                                      });
+
+                                      // Oda nesnesi oluştur
+                                      final room = EditableRoom();
+
+                                      room.isBatchUpload = true;
+                                      room.imagePath = path;
+                                      room.imageCtrl.text = path;
+
+                                      String predictedName = 'backyard';
+
+                                      // AI sınıflandırması
+                                      try {
+                                        predictedName =
+                                        await _aiClassifier.classifyImage(path);
+                                      } catch (e) {
+                                        debugPrint(
+                                          "AI Tahmin hatası: $e",
+                                        );
+                                      }
+
+                                      room.name = predictedName;
+                                      room.nameCtrl.text = predictedName;
+
+                                      if (!mounted) return;
+
+                                      // Odayı listeye ekle
+                                      setState(() {
+                                        floor.rooms.add(room);
+                                      });
+
+                                      // UI'nın yeniden çizilmesine fırsat ver
+                                      await Future<void>.delayed(
+                                        Duration.zero,
+                                      );
+                                    }
+
+                                    if (!mounted) return;
+
+                                    // Yeni yüklenen odalar arasındaki bağlantıları oluştur
+                                    setState(() {
+                                      final lastNew = floor.rooms.length - 1;
+                                      final firstNew = startIndex;
+
+                                      if (firstNew <= lastNew) {
+                                        // Önceden oda varsa ilk yeni odayı önceki odaya bağla
+                                        if (firstNew > 0) {
+                                          final prev = firstNew - 1;
+
+                                          _ensureBidirectionalConnection(
+                                            floor,
+                                            prev,
+                                            firstNew,
+                                          );
+                                        }
+
+                                        // Toplu yüklenen odaları sırayla birbirine bağla
+                                        for (int r = firstNew; r < lastNew; r++) {
+                                          _ensureBidirectionalConnection(
+                                            floor,
+                                            r,
+                                            r + 1,
+                                            pairId: _kBatchConnectionPairId,
+                                          );
+                                        }
+                                      }
+
+                                      // Katı açık tut
+                                      if (fIdx >= 0 &&
+                                          fIdx < _floorExpanded.length) {
+                                        _floorExpanded[fIdx] = true;
+                                      }
+                                    });
+
+                                    // Store'u güncelle
+                                    _syncStore();
+                                  } catch (e, stackTrace) {
+                                    debugPrint(
+                                      "Toplu panorama yükleme hatası: $e",
                                     );
-                                  }
 
-                                  for (var r = firstNew; r < lastNew; r++) {
-                                    _ensureBidirectionalConnection(
-                                      floor,
-                                      r,
-                                      r + 1,
-                                      pairId: _kBatchConnectionPairId,
+                                    debugPrint(
+                                      "$stackTrace",
                                     );
-                                  }
 
-                                  if (fIdx >= 0 &&
-                                      fIdx < _floorExpanded.length) {
-                                    _floorExpanded[fIdx] = true;
+                                    if (mounted) {
+                                      ScaffoldMessenger.of(context).showSnackBar(
+                                        SnackBar(
+                                          content: Text(
+                                            'Panorama yüklenirken hata oluştu: $e',
+                                          ),
+                                        ),
+                                      );
+                                    }
+                                  } finally {
+                                    if (mounted) {
+                                      setState(() {
+                                        _batchUploading = false;
+                                        _batchCurrent = 0;
+                                        _batchTotal = 0;
+                                        _batchFileName = '';
+                                      });
+                                    }
                                   }
-                                });
-                                _syncStore();
-                              },
+                                },
                             ),
                           ],
                         ),

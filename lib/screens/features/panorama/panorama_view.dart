@@ -636,6 +636,7 @@ class _PanoramaViewScreenState extends State<PanoramaViewScreen>
               onViewChanged: _onViewChanged,
               onHotspotClicked: _onHotspotClicked,
               borderRadius: 16.0,
+              sensitivity: 1.0,
               transitionDuration: const Duration(milliseconds: 1200),
             ),
           ),
@@ -736,34 +737,37 @@ class _PanoramaViewScreenState extends State<PanoramaViewScreen>
                         ),
                         child: Tooltip(
                           message: 'Floor Selector',
-                          child: TextButton.icon(
-                            onPressed: _toggleFloorSelector,
-                            icon: Icon(
-                              Icons.layers,
-                              color: _showFloorSelector
-                                  ? AppStyles.accentActive
-                                  : Colors.white70,
-                              size: 20,
-                            ),
-                            label: Text(
-                              'Select Floor',
-                              style: TextStyle(
-                                fontSize: 12,
-                                fontWeight: FontWeight.w600,
-                                color: _showFloorSelector
-                                    ? AppStyles.accentActive
-                                    : Colors.white70,
+                            child: Transform.translate(
+                              offset: const Offset(0, 0), // 12 piksel yukarı
+                              child: TextButton.icon(
+                                onPressed: _toggleFloorSelector,
+                                icon: Icon(
+                                  Icons.layers,
+                                  color: _showFloorSelector
+                                      ? AppStyles.accentActive
+                                      : Colors.white70,
+                                  size: 20,
+                                ),
+                                label: Text(
+                                  'Select Floor',
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.w600,
+                                    color: _showFloorSelector
+                                        ? AppStyles.accentActive
+                                        : Colors.white70,
+                                  ),
+                                ),
+                                style: TextButton.styleFrom(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 10,
+                                    vertical: 16,
+                                  ),
+                                  minimumSize: const Size(36, 36),
+                                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                ),
                               ),
                             ),
-                            style: TextButton.styleFrom(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 10,
-                                vertical: 16,
-                              ),
-                              minimumSize: const Size(36, 36),
-                              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                            ),
-                          ),
                         ),
                       ),
                     ],

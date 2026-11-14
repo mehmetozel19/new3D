@@ -48,6 +48,9 @@ class _PanoramaViewScreenState extends State<PanoramaViewScreen>
   double? _lastZoom;
   bool _hasInitializedView = false;
 
+  // Halka yerleştirme (düzenleme) modu
+  bool _editRings = false;
+
   late AnimationController _floorSelectorAnimationController;
   late AnimationController _timelineAnimationController;
   late AnimationController _appBarHeightAnimationController;
@@ -131,6 +134,7 @@ class _PanoramaViewScreenState extends State<PanoramaViewScreen>
   }
 
   void _onStoreChanged() {
+    _panoImagesCache = null;
     if (mounted) setState(() {});
   }
 
@@ -147,10 +151,19 @@ class _PanoramaViewScreenState extends State<PanoramaViewScreen>
     return _store.floorRooms[_currentFloor] ?? const <RoomData>[];
   }
 
+  // Resim listesi her build'de yeniden üretilmesin diye cache'lenir.
+  List<Image>? _panoImagesCache;
+  int? _panoImagesCacheFloor;
+
   List<Image> get _currentPanoImages {
-    return _currentRooms
+    if (_panoImagesCache != null && _panoImagesCacheFloor == _currentFloor) {
+      return _panoImagesCache!;
+    }
+    _panoImagesCacheFloor = _currentFloor;
+    _panoImagesCache = _currentRooms
         .map((room) => Image.file(File(room.imagePath)))
         .toList();
+    return _panoImagesCache!;
   }
 
   List<PanoHotspot> get _currentHotspots {
@@ -169,6 +182,19 @@ class _PanoramaViewScreenState extends State<PanoramaViewScreen>
           ),
         )
         .toList();
+  }
+
+  // Kayıtlı halka konumları: "from>to" -> [boylam, enlem]
+  Map<String, List<double>> get _ringPositions {
+    final result = <String, List<double>>{};
+    final list = _store.floorHotspots[_currentFloor] ?? const <HotspotData>[];
+    for (final h in list) {
+      if (h.targetFloorId != null) continue;
+      // Eski otomatik değerleri (enlem 0, boylam ±25) "yerleştirilmemiş" say.
+      if (h.latitude == 0 && h.longitude.abs() == 25) continue;
+      result['${h.fromRoomId}>${h.toRoomId}'] = [h.longitude, h.latitude];
+    }
+    return result;
   }
 
   List<int> _getConnectedRooms(int currentRoomId) {
@@ -298,9 +324,12 @@ class _PanoramaViewScreenState extends State<PanoramaViewScreen>
     void apply() {
       _clearPreviewUI();
 
+      final int maxIdx =
+          _currentTimelineItems.isEmpty ? 0 : _currentTimelineItems.length - 1;
+
       setState(() {
         _currentPanoId = panoId;
-        _currentTimelineIndex = panoId.clamp(0, 9);
+        _currentTimelineIndex = panoId.clamp(0, maxIdx);
         _lastRoomByFloor[_currentFloor] = panoId;
 
         if (_hideInfoBox && _currentRoomDescription.trim().isNotEmpty) {
@@ -587,7 +616,25 @@ class _PanoramaViewScreenState extends State<PanoramaViewScreen>
                                 textAlign: TextAlign.center,
                               ),
                             ),
-                            const SizedBox(width: 32),
+                            // Halka yerleştirme modunu aç/kapat
+                            IconButton(
+                              tooltip: 'Halkaları yerleştir',
+                              icon: Icon(
+                                _editRings
+                                    ? Icons.close
+                                    : Icons.edit_location_alt,
+                                color: Colors.black,
+                                size: 20,
+                              ),
+                              onPressed: () =>
+                                  setState(() => _editRings = !_editRings),
+                              iconSize: 20,
+                              padding: const EdgeInsets.all(4),
+                              constraints: const BoxConstraints(
+                                minWidth: 32,
+                                minHeight: 32,
+                              ),
+                            ),
                           ],
                         ),
                       ),
@@ -637,37 +684,47 @@ class _PanoramaViewScreenState extends State<PanoramaViewScreen>
               onHotspotClicked: _onHotspotClicked,
               borderRadius: 16.0,
               sensitivity: 1.0,
+              dragBoost: 3.0,
+              maxTextureWidth: 6144,
               transitionDuration: const Duration(milliseconds: 1200),
+              editMode: _editRings,
+              ringPositions: _ringPositions,
+              onEditSave: (rings) {
+                _store.setRingPositions(_currentFloor, rings);
+                setState(() => _editRings = false);
+              },
+              onEditCancel: () => setState(() => _editRings = false),
             ),
           ),
-          Positioned(
-            left: 0,
-            right: 0,
-            bottom: _compassBottom,
-            child: Center(
-              child: AnimatedOpacity(
-                opacity: _isCompassFaded
-                    ? (_showTimelineScroller ? 0.25 : 0.0)
-                    : (_showTimelineScroller ? 1.0 : 0.0),
-                duration: const Duration(milliseconds: 250),
-                curve: Curves.easeInOut,
-                child: CompassNavigator(
-                  rooms: _compassRooms,
-                  currentRoomId: _encodeId(_currentFloor, _currentPanoId),
-                  previewActive: _showRoomDescription,
-                  externalPreviewRoomId: _compassPreviewRequestId,
-                  onExternalPreviewHandled: () =>
-                      setState(() => _compassPreviewRequestId = null),
-                  onRoomSelected: _onCompassRoomSelected,
-                  onRoomPreview: _onCompassRoomPreview,
-                  onPreviewClear: _onCompassPreviewClear,
-                  width: 300,
-                  height: _compassHeight,
+          if (!_editRings)
+            Positioned(
+              left: 0,
+              right: 0,
+              bottom: _compassBottom,
+              child: Center(
+                child: AnimatedOpacity(
+                  opacity: _isCompassFaded
+                      ? (_showTimelineScroller ? 0.25 : 0.0)
+                      : (_showTimelineScroller ? 1.0 : 0.0),
+                  duration: const Duration(milliseconds: 250),
+                  curve: Curves.easeInOut,
+                  child: CompassNavigator(
+                    rooms: _compassRooms,
+                    currentRoomId: _encodeId(_currentFloor, _currentPanoId),
+                    previewActive: _showRoomDescription,
+                    externalPreviewRoomId: _compassPreviewRequestId,
+                    onExternalPreviewHandled: () =>
+                        setState(() => _compassPreviewRequestId = null),
+                    onRoomSelected: _onCompassRoomSelected,
+                    onRoomPreview: _onCompassRoomPreview,
+                    onPreviewClear: _onCompassPreviewClear,
+                    width: 300,
+                    height: _compassHeight,
+                  ),
                 ),
               ),
             ),
-          ),
-          if (_showFloorSelector)
+          if (_showFloorSelector && !_editRings)
             Positioned(
               left: 0,
               right: 0,
@@ -689,188 +746,180 @@ class _PanoramaViewScreenState extends State<PanoramaViewScreen>
                 ),
               ),
             ),
-          Positioned(
-            left: 0,
-            right: 0,
-            bottom: bottomPadding,
-            child: Center(
-              child: Builder(
-                builder: (context) {
-                  final useGlass = _showTimelineScroller && !_showFloorSelector;
-                  final radius = AppStyles.pillRadius;
+          if (!_editRings)
+            Positioned(
+              left: 0,
+              right: 0,
+              bottom: bottomPadding,
+              child: Center(
+                child: Builder(
+                  builder: (context) {
+                    final useGlass =
+                        _showTimelineScroller && !_showFloorSelector;
+                    final radius = AppStyles.pillRadius;
 
-                  final containerChild = Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Container(
-                        decoration: BoxDecoration(
-                          color: _showTimelineScroller
-                              ? AppStyles.controlBgActive
-                              : AppStyles.controlBg,
-                          borderRadius: BorderRadius.circular(20),
-                        ),
-                        child: IconButton(
-                          icon: Icon(
-                            Icons.timeline,
+                    final containerChild = Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Container(
+                          decoration: BoxDecoration(
                             color: _showTimelineScroller
-                                ? AppStyles.accentActive
-                                : Colors.black,
-                            size: 20,
+                                ? AppStyles.controlBgActive
+                                : AppStyles.controlBg,
+                            borderRadius: BorderRadius.circular(20),
                           ),
-                          onPressed: _toggleTimelineScroller,
-                          tooltip: 'Rooms',
-                          iconSize: 20,
-                          padding: const EdgeInsets.all(8),
-                          constraints: const BoxConstraints(
-                            minWidth: 36,
-                            minHeight: 36,
+                          child: IconButton(
+                            icon: Icon(
+                              Icons.timeline,
+                              color: _showTimelineScroller
+                                  ? AppStyles.accentActive
+                                  : Colors.black,
+                              size: 20,
+                            ),
+                            onPressed: _toggleTimelineScroller,
+                            tooltip: 'Rooms',
+                            iconSize: 20,
+                            padding: const EdgeInsets.all(8),
+                            constraints: const BoxConstraints(
+                              minWidth: 36,
+                              minHeight: 36,
+                            ),
                           ),
                         ),
-                      ),
-                      const SizedBox(width: 8),
-                      Container(
-                        decoration: BoxDecoration(
-                          color: _showFloorSelector
-                              ? AppStyles.accentActive.withOpacity(0.12)
-                              : AppStyles.controlBg,
-                          borderRadius: BorderRadius.circular(20),
-                        ),
-                        child: Tooltip(
-                          message: 'Floor Selector',
-                            child: Transform.translate(
-                              offset: const Offset(0, 0), // 12 piksel yukarı
-                              child: TextButton.icon(
-                                onPressed: _toggleFloorSelector,
-                                icon: Icon(
-                                  Icons.layers,
+                        const SizedBox(width: 8),
+                        Container(
+                          decoration: BoxDecoration(
+                            color: _showFloorSelector
+                                ? AppStyles.accentActive.withOpacity(0.12)
+                                : AppStyles.controlBg,
+                            borderRadius: BorderRadius.circular(20),
+                          ),
+                          child: Tooltip(
+                            message: 'Floor Selector',
+                            child: TextButton.icon(
+                              onPressed: _toggleFloorSelector,
+                              icon: Icon(
+                                Icons.layers,
+                                color: _showFloorSelector
+                                    ? AppStyles.accentActive
+                                    : Colors.white70,
+                                size: 20,
+                              ),
+                              label: Text(
+                                'Select Floor',
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  fontWeight: FontWeight.w600,
                                   color: _showFloorSelector
                                       ? AppStyles.accentActive
                                       : Colors.white70,
-                                  size: 20,
-                                ),
-                                label: Text(
-                                  'Select Floor',
-                                  style: TextStyle(
-                                    fontSize: 12,
-                                    fontWeight: FontWeight.w600,
-                                    color: _showFloorSelector
-                                        ? AppStyles.accentActive
-                                        : Colors.white70,
-                                  ),
-                                ),
-                                style: TextButton.styleFrom(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 10,
-                                    vertical: 16,
-                                  ),
-                                  minimumSize: const Size(36, 36),
-                                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                                 ),
                               ),
+                              style: TextButton.styleFrom(
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 10,
+                                  vertical: 16,
+                                ),
+                                minimumSize: const Size(36, 36),
+                                tapTargetSize:
+                                    MaterialTapTargetSize.shrinkWrap,
+                              ),
                             ),
-                        ),
-                      ),
-                    ],
-                  );
-
-                  if (useGlass) {
-                    return ClipRRect(
-                      borderRadius: BorderRadius.circular(radius),
-                      child: BackdropFilter(
-                        filter: ImageFilter.blur(sigmaX: 14, sigmaY: 14),
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 4,
-                            vertical: 4,
                           ),
-                          decoration: BoxDecoration(
-                            gradient: const LinearGradient(
-                              begin: Alignment.topLeft,
-                              end: Alignment.bottomRight,
-                              colors: [
-                                Color.fromRGBO(0, 0, 0, 0.28),
-                                Color.fromRGBO(0, 0, 0, 0.18),
+                        ),
+                      ],
+                    );
+
+                    if (useGlass) {
+                      return ClipRRect(
+                        borderRadius: BorderRadius.circular(radius),
+                        child: BackdropFilter(
+                          filter: ImageFilter.blur(sigmaX: 14, sigmaY: 14),
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 4,
+                              vertical: 4,
+                            ),
+                            decoration: BoxDecoration(
+                              gradient: const LinearGradient(
+                                begin: Alignment.topLeft,
+                                end: Alignment.bottomRight,
+                                colors: [
+                                  Color.fromRGBO(0, 0, 0, 0.28),
+                                  Color.fromRGBO(0, 0, 0, 0.18),
+                                ],
+                              ),
+                              borderRadius: BorderRadius.circular(radius),
+                              border: Border.all(
+                                color:
+                                    const Color.fromRGBO(255, 255, 255, 0.45),
+                                width: AppStyles.borderWidth,
+                              ),
+                              boxShadow: [
+                                const BoxShadow(
+                                  color: Color.fromRGBO(0, 0, 0, 0.10),
+                                  blurRadius: 20,
+                                  offset: Offset(0, 8),
+                                ),
                               ],
                             ),
-                            borderRadius: BorderRadius.circular(radius),
-                            border: Border.all(
-                              color: const Color.fromRGBO(255, 255, 255, 0.45),
-                              width: AppStyles.borderWidth,
-                            ),
-                            boxShadow: [
-                              const BoxShadow(
-                                color: Color.fromRGBO(0, 0, 0, 0.10),
-                                blurRadius: 20,
-                                offset: Offset(0, 8),
-                              ),
-                            ],
+                            child: containerChild,
                           ),
-                          child: containerChild,
                         ),
+                      );
+                    }
+
+                    return ClipRRect(
+                      borderRadius: BorderRadius.circular(radius),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 4,
+                          vertical: 4,
+                        ),
+                        decoration: BoxDecoration(
+                          color: AppStyles.surface,
+                          borderRadius: BorderRadius.circular(radius),
+                          border: Border.all(
+                            color: AppStyles.border,
+                            width: AppStyles.borderWidth,
+                          ),
+                          boxShadow: [AppStyles.shadow],
+                        ),
+                        child: containerChild,
                       ),
                     );
-                  }
-
-                  return ClipRRect(
-                    borderRadius: BorderRadius.circular(radius),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 4,
-                        vertical: 4,
-                      ),
-                      decoration: BoxDecoration(
-                        color: AppStyles.surface,
-                        borderRadius: BorderRadius.circular(radius),
-                        border: Border.all(
-                          color: AppStyles.border,
-                          width: AppStyles.borderWidth,
-                        ),
-                        boxShadow: [AppStyles.shadow],
-                      ),
-                      child: containerChild,
-                    ),
-                  );
-                },
+                  },
+                ),
               ),
             ),
-          ),
-          Positioned(
-            left: 20,
-            right: 20,
-            bottom: _infoBottom,
-            child: AnimatedOpacity(
-              opacity: _showTimelineScroller &&
-                      !_hideInfoBox &&
-                      _currentRoomDescription.trim().isNotEmpty
-                  ? 1.0
-                  : 0.0,
-              duration: const Duration(milliseconds: 220),
-              curve: Curves.easeOutCubic,
-              child: IgnorePointer(
-                ignoring: !_showTimelineScroller ||
-                    _hideInfoBox ||
-                    _currentRoomDescription.trim().isEmpty,
-                child: Center(
-                  child: FractionallySizedBox(
-                    widthFactor: 0.5,
-                    child: _RoomInfoBox(
-                      expanded: _roomInfoExpanded,
-                      title: _currentRooms
-                              .where((r) => r.id == _currentPanoId)
-                              .map((r) => r.name)
-                              .cast<String?>()
-                              .firstWhere((e) => e != null, orElse: () => '') ??
-                          '',
-                      description: _currentRoomDescription,
-                      onToggle: () => setState(() {
-                        _roomInfoExpanded = !_roomInfoExpanded;
-                      }),
-                    ),
+          // Oda bilgi kutusu: görünmezken ağaçtan tamamen çıkar (blur maliyeti).
+          if (!_editRings &&
+              _showTimelineScroller &&
+              !_hideInfoBox &&
+              _currentRoomDescription.trim().isNotEmpty)
+            Positioned(
+              left: 20,
+              right: 20,
+              bottom: _infoBottom,
+              child: Center(
+                child: FractionallySizedBox(
+                  widthFactor: 0.5,
+                  child: _RoomInfoBox(
+                    expanded: _roomInfoExpanded,
+                    title: _currentRooms
+                            .where((r) => r.id == _currentPanoId)
+                            .map((r) => r.name)
+                            .cast<String?>()
+                            .firstWhere((e) => e != null, orElse: () => '') ??
+                        '',
+                    description: _currentRoomDescription,
+                    onToggle: () => setState(() {
+                      _roomInfoExpanded = !_roomInfoExpanded;
+                    }),
                   ),
                 ),
               ),
             ),
-          ),
         ],
       ),
     );

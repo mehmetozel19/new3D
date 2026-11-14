@@ -76,6 +76,49 @@ class PanoramaData extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Gezinti ekranında yerleştirilen halka konumlarını kaydeder.
+  /// [rings] anahtarı "from>to", değeri [boylam, enlem] şeklindedir.
+  void setRingPositions(int floor, Map<String, List<double>> rings) {
+    final list = List<HotspotData>.from(floorHotspots[floor] ?? const []);
+    final done = <String>{};
+
+    for (int i = 0; i < list.length; i++) {
+      final h = list[i];
+      if (h.targetFloorId != null) continue;
+
+      final key = '${h.fromRoomId}>${h.toRoomId}';
+      final p = rings[key];
+      if (p == null) continue;
+
+      list[i] = HotspotData(
+        fromRoomId: h.fromRoomId,
+        toRoomId: h.toRoomId,
+        latitude: p[1],
+        longitude: p[0],
+        text: h.text,
+        icon: h.icon,
+      );
+      done.add(key);
+    }
+
+    // Hotspot'u olmayan bağlantılar için yenisini ekle.
+    rings.forEach((key, p) {
+      if (done.contains(key)) return;
+      final parts = key.split('>');
+      list.add(HotspotData(
+        fromRoomId: int.parse(parts[0]),
+        toRoomId: int.parse(parts[1]),
+        latitude: p[1],
+        longitude: p[0],
+        text: '',
+        icon: Icons.circle_outlined,
+      ));
+    });
+
+    floorHotspots[floor] = list;
+    notifyListeners();
+  }
+
   void _setFloorFromEditorInternal(int floorIdx, FloorEditor floor) {
     final rooms = <RoomData>[];
     for (int rIdx = 0; rIdx < floor.rooms.length; rIdx++) {
